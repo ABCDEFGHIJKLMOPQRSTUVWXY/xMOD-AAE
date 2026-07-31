@@ -31,7 +31,7 @@ class ChunkQueue(QThread):
 
     def run(self):
         end = min(self._start_index + 1 + self._preload_count, len(self._chunks))
-        for i in range(self._start_index + 1, end):
+        for i in range(self._start_index, end):
             if self._cancelled:
                 break
 

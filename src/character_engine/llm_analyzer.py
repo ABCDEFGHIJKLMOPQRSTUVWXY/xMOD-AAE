@@ -65,13 +65,16 @@ _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]", re.MULTILINE)
 def _mark_dialogue_spans(
     para_text: str,
     spans: list[DialogueSegment],
+    base_offset: int = 0,
 ) -> str:
     marked = ""
     cursor = 0
     for s_idx, span in enumerate(spans):
-        marked += para_text[cursor:span.start]
-        marked += f"【对话{s_idx + 1}】{para_text[span.start:span.end]}【/对话】"
-        cursor = span.end
+        local_start = base_offset + span.start
+        local_end = base_offset + span.end
+        marked += para_text[cursor:local_start]
+        marked += f"【对话{s_idx + 1}】{para_text[local_start:local_end]}【/对话】"
+        cursor = local_end
     marked += para_text[cursor:]
     return marked
 
@@ -236,14 +239,14 @@ class LLMAnalyzer:
 
     def identify_speakers(
         self,
-        paragraph_batches: list[list[tuple[str, list[DialogueSegment]]]],
+        paragraph_batches: list[list[tuple[str, list[DialogueSegment], int]]],
         progress_callback: object = None,
     ) -> list[DialogueSegment]:
         """Identify speakers for dialogue spans using LLM.
 
         Args:
             paragraph_batches: List of batches, each batch is a list of
-                (paragraph_text, list_of_dialogue_spans) tuples.
+                (paragraph_text, list_of_dialogue_spans, base_offset) tuples.
                 Max 10 paragraphs per batch.
             progress_callback: (current, total, message) -> None
 
@@ -258,8 +261,8 @@ class LLMAnalyzer:
                 progress_callback(batch_idx + 1, total_batches, f"正在识别第{batch_idx + 1}批对话...")
 
             prompt_parts: list[str] = []
-            for para_idx, (para_text, spans) in enumerate(batch):
-                marked_para = _mark_dialogue_spans(para_text, spans)
+            for para_idx, (para_text, spans, base_offset) in enumerate(batch):
+                marked_para = _mark_dialogue_spans(para_text, spans, base_offset)
                 prompt_parts.append(f"--- 段落 {para_idx + 1} ---\n{marked_para}")
 
             user_content = "\n".join(prompt_parts)
@@ -293,7 +296,7 @@ class LLMAnalyzer:
                 except Exception:
                     pass
 
-            for para_idx, (_para_text, spans) in enumerate(batch):
+            for para_idx, (_para_text, spans, _base_offset) in enumerate(batch):
                 for s_idx, span in enumerate(spans):
                     speaker = assignments_map.get((para_idx + 1, s_idx + 1))
                     span.speaker = speaker

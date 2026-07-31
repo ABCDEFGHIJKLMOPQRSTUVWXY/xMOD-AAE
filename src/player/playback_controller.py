@@ -62,7 +62,7 @@ class PlaybackController(QObject):
             para_chunks = build(para_segments, voice_map, char_offset)
             self.chunks.extend(para_chunks)
             if para_chunks:
-                char_offset = para_chunks[-1].char_end
+                char_offset = para_chunks[-1].char_end + 1  # +1 与展示文本中的段落间 \\n 对齐
 
         self.chunk_index = 0
         self.chapter_changed.emit(chapter_index, total_chapters)

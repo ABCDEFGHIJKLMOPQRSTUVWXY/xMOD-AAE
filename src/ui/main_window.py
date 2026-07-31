@@ -99,6 +99,7 @@ class MainWindow(QMainWindow):
         self._current_chapter_index: int = 0
         self._chapter_texts: list[str] = []
         self._dialogue_segments_cache: dict[int, list] = {}
+        self._original_paragraphs_cache: dict[int, list[str]] = {}
         self._voice_map: dict[str, str] = {"_narrator_": get_default_narrator_voice()}
 
         self._build_menu_bar()
@@ -119,6 +120,12 @@ class MainWindow(QMainWindow):
 
         char_menu = menubar.addMenu("角色(&C)")
         char_menu.addAction("分析角色(&A)", self._analyze_characters)
+
+        view_menu = menubar.addMenu("视图(&V)")
+        self._toggle_segments_action = view_menu.addAction("显示分段结构(&S)")
+        self._toggle_segments_action.setCheckable(True)
+        self._toggle_segments_action.setChecked(True)
+        self._toggle_segments_action.triggered.connect(self._on_toggle_segments)
 
         settings_menu = menubar.addMenu("设置(&S)")
         settings_menu.addAction("偏好设置(&P)...", self._show_settings)
@@ -234,19 +241,27 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "无法识别章节结构，将作为单章处理")
             self._chapters = [("全文", text)]
 
-        from text_processor.paragraph import split as split_paragraphs
+        import re
         from text_processor.dialogue import extract_spans
+
+        _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 
         self._chapter_texts = []
         self._dialogue_segments_cache = {}
+        self._original_paragraphs_cache = {}
 
         for ch_idx, (title, content) in enumerate(self._chapters):
             self._chapter_texts.append(content)
-            paragraphs = split_paragraphs(content)
+            raw_paragraphs = _PARA_SPLIT_RE.split(content)
+            original_paras = []
             para_dialogue_segments = []
-            for para in paragraphs:
-                segs = extract_spans(para)
-                para_dialogue_segments.append(segs)
+            for raw_p in raw_paragraphs:
+                stripped = raw_p.strip()
+                if len(stripped) >= 5:
+                    original_paras.append(raw_p)
+                    segs = extract_spans(stripped)
+                    para_dialogue_segments.append(segs)
+            self._original_paragraphs_cache[ch_idx] = original_paras
             self._dialogue_segments_cache[ch_idx] = para_dialogue_segments
 
         db_voice_map = self._store.get_voice_map(book_id)
@@ -277,10 +292,40 @@ class MainWindow(QMainWindow):
 
         self._current_chapter_index = chapter_index
         title, content = self._chapters[chapter_index]
-        self._reader_view.set_text(content)
+
+        # ── 从结构化分段重建展示文本 + 全局偏移量 ──────────────
+        para_segments = self._dialogue_segments_cache.get(chapter_index, [])
+        display_text, global_segments = self._build_display_from_segments(para_segments)
+
+        self._reader_view.set_text(display_text)
+        self._reader_view.set_segments(global_segments)
         self._chapter_list.set_current(chapter_index)
 
         self._store.update_position(self._current_book_id, chapter_index, 0)
+
+    @staticmethod
+    def _build_display_from_segments(
+        para_segments: list[list],
+    ) -> tuple[str, list[tuple[int, int, bool]]]:
+        """从对话分段列表重建展示文本和全局分段偏移量。
+
+        将每段中所有 DialogueSegment.text 直接拼接，以保证偏移量与
+        segment_builder.build() 使用的 char_offset 完全一致。
+        段落之间用 \\n 连接，偏移量正确计入分隔符。
+        """
+        display_parts: list[str] = []
+        global_segments: list[tuple[int, int, bool]] = []
+        pos = 0
+
+        for para_segs in para_segments:
+            for seg in para_segs:
+                global_segments.append((pos + seg.start, pos + seg.end, seg.is_dialogue))
+            para_text = "".join(s.text for s in para_segs)
+            display_parts.append(para_text)
+            pos += len(para_text) + 1  # +1 为段落间的 \\n 分隔符
+
+        display_text = "\n".join(display_parts) if display_parts else ""
+        return display_text, global_segments
 
     def _on_chapter_clicked(self, index: int) -> None:
         self._controller.stop()
@@ -389,18 +434,23 @@ class MainWindow(QMainWindow):
             "3. 或在 设置 → LLM 模型 中切换到云端 API"
         )
 
-    def _build_speaker_id_batches(self, batch_size: int = 5) -> list[list[tuple[str, list]]]:
-        batches: list[list[tuple[str, list]]] = []
-        current_batch: list[tuple[str, list]] = []
+    def _build_speaker_id_batches(self, batch_size: int = 5) -> list[list[tuple[str, list, int]]]:
+        batches: list[list[tuple[str, list, int]]] = []
+        current_batch: list[tuple[str, list, int]] = []
 
         for ch_idx in range(len(self._chapters)):
             para_segments = self._dialogue_segments_cache.get(ch_idx, [])
-            for segs in para_segments:
+            original_paras = self._original_paragraphs_cache.get(ch_idx, [])
+
+            for segs, original_para in zip(para_segments, original_paras):
                 dialogue_spans = [s for s in segs if s.is_dialogue]
                 if not dialogue_spans:
                     continue
-                para_text = "".join(s.text for s in segs)
-                current_batch.append((para_text, dialogue_spans))
+                stripped_text = "".join(s.text for s in segs)
+                base_offset = original_para.find(stripped_text)
+                if base_offset < 0:
+                    base_offset = 0
+                current_batch.append((original_para, dialogue_spans, base_offset))
                 if len(current_batch) >= batch_size:
                     batches.append(current_batch)
                     current_batch = []
@@ -423,6 +473,12 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self._store, self._available_voices, self)
         if dialog.exec() == dialog.DialogCode.Accepted:
             self._status_label.setText("设置已保存")
+
+    def _on_toggle_segments(self, checked: bool) -> None:
+        """切换分段结构叠加的显示/隐藏。"""
+        self._reader_view.set_show_segments(checked)
+        state = "显示" if checked else "隐藏"
+        self._status_label.setText(f"分段结构：{state}")
 
     def closeEvent(self, event) -> None:
         self._controller.stop()
