@@ -7,7 +7,6 @@ class AudioPlayer:
     def __init__(self):
         self._current_chunk_index = -1
         self._chunks: list = []
-        self._on_chunk_finished = None
         self._paused = False
         self._stopped = True
         self._volume: float = 1.0
@@ -57,9 +56,6 @@ class AudioPlayer:
     def set_volume(self, volume: float):
         self._volume = max(0.0, min(1.0, volume))
         pygame.mixer.music.set_volume(self._volume)
-
-    def is_playing(self) -> bool:
-        return pygame.mixer.music.get_busy()
 
     @property
     def current_chunk_index(self) -> int:

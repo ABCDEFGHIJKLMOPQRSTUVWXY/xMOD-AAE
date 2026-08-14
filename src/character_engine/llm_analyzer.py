@@ -34,12 +34,8 @@ _SYSTEM_PROMPT = """You are a literary analyst. Given dialogue lines from a char
     "summary": "一句话角色描述"
 }"""
 
-_ATTRIBUTION_PROMPT = """You are a literary analyst. Given ambiguous dialogue quotes from a novel (with surrounding context), determine which known character most likely spoke each line. Known characters: {names}
 
-Return a JSON array of assignments:
-[{"index": 0, "speaker": "角色名"}, ...]
-
-If you cannot determine the speaker, set speaker to "未知"."""
+_TEXT_TASK_EXCLUDED = ("vl", "vision", "clip", "llava", "minicpm-v")
 
 _SPEAKER_ID_PROMPT = """你是一个文学分析助手。以下是一段小说段落，标记了对话内容的位置（用 【对话】...【/对话】 包裹）。
 请识别每段对话的说话人姓名。
@@ -48,15 +44,14 @@ _SPEAKER_ID_PROMPT = """你是一个文学分析助手。以下是一段小说�
 1. 说话人可能是具体人名、常用称呼、或代词（他/她）
 2. 如果同一个人在不同段落用了不同称呼（如"李耀"、"少年"、"他"），统一为最正式的人名
 3. 如果无法判断，标注为"未知"
-4. 只返回 JSON，不要 markdown 代码块，不要任何其他文字
+4. 只返回一个 JSON 对象，禁止输出任何其他文字、解释、markdown 代码块，禁止复述原文
 
-返回格式：
-{
-  "assignments": [
-    {"paragraph": 段落序号, "span": 对话序号, "speaker": "说话人"},
-    ...
-  ]
-}"""
+严格输出格式（不要包含段落原文）：
+{"assignments": [{"paragraph": 段落序号, "span": 对话序号, "speaker": "说话人"}, ...]}"""
+
+_SPEAKER_ID_RETRY_PROMPT = """你刚才的回复不符合要求：你没有输出可解析的 JSON，而是复述了原文或写了其他文字。
+请重新分析，但这次只输出一个 JSON 对象，格式如下，绝对不要包含任何其他文字、解释、代码块或原文：
+{"assignments": [{"paragraph": 段落序号, "span": 对话序号, "speaker": "说话人"}, ...]}"""
 
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]", re.MULTILINE)
@@ -107,12 +102,19 @@ class LLMAnalyzer:
         return self._ollama_available
 
     def _resolve_ollama_model(self) -> str:
-        """Pick the best available Ollama model, preferring Chinese-capable ones."""
+        """Pick the best available Ollama model, preferring Chinese-capable text models."""
         configured = self._settings.get("llm_model", "")
+
+        text_models = [
+            m for m in self._available_ollama_models
+            if not any(tok in m for tok in _TEXT_TASK_EXCLUDED)
+        ]
+
         if configured and configured in self._available_ollama_models:
-            return configured
+            if configured in text_models:
+                return configured
         if configured:
-            for m in self._available_ollama_models:
+            for m in text_models:
                 if configured in m:
                     return m
 
@@ -121,11 +123,17 @@ class LLMAnalyzer:
                      "yi:6b", "yi:9b", "llama3.1:8b", "llama3:8b",
                      "gemma2:9b", "mistral:7b"]
         for p in preferred:
-            for m in self._available_ollama_models:
+            for m in text_models:
                 if m == p or m.startswith(p):
                     return m
 
+        if text_models:
+            return text_models[0]
         if self._available_ollama_models:
+            print(
+                "[LLMAnalyzer] 本地仅有视觉模型，文本角色分析效果可能很差",
+                file=sys.stderr,
+            )
             return self._available_ollama_models[0]
         return "qwen2.5:7b"
 
@@ -192,51 +200,6 @@ class LLMAnalyzer:
 
         return profiles
 
-    def attribute_ambiguous_quotes(
-        self, unattributed: list[tuple[str, str]], known_names: list[str]
-    ) -> list[dict[str, str | int]]:
-        if not unattributed:
-            return []
-
-        quotes_block_parts: list[str] = []
-        for idx, (quote_text, context) in enumerate(unattributed):
-            ctx_str = f" [上下文: {context}]" if context else ""
-            quotes_block_parts.append(f"{idx}. \"{quote_text}\"{ctx_str}")
-
-        quotes_block = "\n".join(quotes_block_parts)
-        user_content = f"Attribute each quote to a known speaker:\n\n{quotes_block}"
-
-        result = self._call_llm(
-            [{"role": "user", "content": user_content}],
-            system_prompt=_ATTRIBUTION_PROMPT.format(
-                names=", ".join(known_names)
-            ),
-        )
-
-        if result is None:
-            return [{"index": i, "speaker": "未知"} for i in range(len(unattributed))]
-
-        assignments: list[dict[str, str | int]] = []
-        try:
-            if isinstance(result, list):
-                for item in result:
-                    if isinstance(item, dict) and "index" in item:
-                        assignments.append(item)
-            elif isinstance(result, dict):
-                if "assignments" in result and isinstance(result["assignments"], list):
-                    for item in result["assignments"]:
-                        if isinstance(item, dict) and "index" in item:
-                            assignments.append(item)
-        except Exception:
-            pass
-
-        assigned_indices = {a.get("index") for a in assignments}
-        for i in range(len(unattributed)):
-            if i not in assigned_indices:
-                assignments.append({"index": i, "speaker": "未知"})
-
-        return assignments
-
     def identify_speakers(
         self,
         paragraph_batches: list[list[tuple[str, list[DialogueSegment], int]]],
@@ -278,6 +241,22 @@ class LLMAnalyzer:
                 system_prompt=_SPEAKER_ID_PROMPT,
                 timeout_sec=120.0,
             )
+            if result is None:
+                # Self-correct: ask the model to retry outputting strict JSON only.
+                print(
+                    f"[LLMAnalyzer] Speaker ID Batch {batch_idx + 1}/{total_batches} "
+                    f"produced no parseable JSON; retrying once with correction",
+                    file=sys.stderr,
+                )
+                result = self._call_llm(
+                    [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": "（请重新只输出 JSON）"},
+                        {"role": "user", "content": _SPEAKER_ID_RETRY_PROMPT},
+                    ],
+                    system_prompt=_SPEAKER_ID_PROMPT,
+                    timeout_sec=120.0,
+                )
 
             assignments_map: dict[tuple[int, int], str] = {}
             if result is not None:
@@ -320,9 +299,15 @@ class LLMAnalyzer:
         if system_prompt:
             messages = [{"role": "system", "content": system_prompt}] + messages
 
-        if self.probe_ollama():
-            return self._call_ollama(messages, timeout_sec=timeout_sec)
-        return self._call_cloud_api(messages)
+        mode = self._settings.get("llm_mode", "ollama")
+        if mode == "cloud":
+            return self._call_cloud_api(messages, timeout_sec=timeout_sec)
+
+        if not self.probe_ollama():
+            raise RuntimeError(
+                "Ollama 不可用：请先启动 Ollama，或在设置中切换到云端 API"
+            )
+        return self._call_ollama(messages, timeout_sec=timeout_sec)
 
     def _call_ollama(self, messages: list[dict], timeout_sec: float = 60.0) -> dict | list | None:
         model = self._resolve_ollama_model()
@@ -330,6 +315,7 @@ class LLMAnalyzer:
             "model": model,
             "messages": messages,
             "stream": False,
+            "format": "json",  # require strict JSON output (Ollama >= 0.3.4)
         }
         try:
             resp = httpx.post(
@@ -345,16 +331,19 @@ class LLMAnalyzer:
             print(f"[LLMAnalyzer] Ollama call failed (model={model}): {exc}", file=sys.stderr)
             return None
 
-    def _call_cloud_api(self, messages: list[dict]) -> dict | list | None:
-        api_url = self._settings.get("api_url", "")
-        api_key = self._settings.get("api_key", "")
-        model_name = self._settings.get("model_name", "gpt-4o-mini")
+    def _call_cloud_api(
+        self, messages: list[dict], timeout_sec: float = 30.0
+    ) -> dict | list | None:
+        api_url = self._settings.get("llm_endpoint", "")
+        api_key = self._settings.get("llm_api_key", "")
+        model_name = self._settings.get("llm_model", "gpt-4o-mini")
 
         if not api_url or not api_key:
-            print("[LLMAnalyzer] Cloud API not configured", file=sys.stderr)
-            return None
+            raise RuntimeError(
+                "云端 API 未配置：请在设置中填写 API 端点和密钥"
+            )
 
-        payload = {
+        base_payload = {
             "model": model_name,
             "messages": messages,
             "temperature": 0.3,
@@ -363,12 +352,13 @@ class LLMAnalyzer:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        try:
+
+        def post(payload):
             resp = httpx.post(
                 api_url,
                 json=payload,
                 headers=headers,
-                timeout=httpx.Timeout(30.0),
+                timeout=httpx.Timeout(timeout_sec),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -377,10 +367,34 @@ class LLMAnalyzer:
                 content = data["choices"][0].get("message", {}).get("content", "")
             elif "message" in data:
                 content = data["message"].get("content", "")
-            return self._parse_json_response(content)
+            return content
+
+        # 首选严格 JSON 模式；仅当端点返回 4xx（不支持 response_format）时，
+        # 去掉该字段重试一次。超时等其他错误不重试，交由上游自纠错逻辑处理。
+        try:
+            content = post({**base_payload, "response_format": {"type": "json_object"}})
+        except httpx.HTTPStatusError as exc:
+            if 400 <= exc.response.status_code < 500:
+                print(
+                    f"[LLMAnalyzer] Cloud API (json mode) 4xx, retrying w/o response_format: "
+                    f"{exc.response.status_code}",
+                    file=sys.stderr,
+                )
+                try:
+                    content = post(base_payload)
+                except Exception as exc2:
+                    print(f"[LLMAnalyzer] Cloud API call failed: {exc2}", file=sys.stderr)
+                    return None
+            else:
+                print(
+                    f"[LLMAnalyzer] Cloud API (json mode) failed: {exc.response.status_code}",
+                    file=sys.stderr,
+                )
+                return None
         except Exception as exc:
-            print(f"[LLMAnalyzer] Cloud API call failed: {exc}", file=sys.stderr)
+            print(f"[LLMAnalyzer] Cloud API (json mode) failed: {exc}", file=sys.stderr)
             return None
+        return self._parse_json_response(content)
 
     def _parse_json_response(self, text: str) -> dict | list | None:
         if not text:
@@ -394,25 +408,41 @@ class LLMAnalyzer:
 
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            print(
+                f"[LLMAnalyzer][dbg] whole-text json.loads failed: {exc.msg} @col {exc.pos}",
+                file=sys.stderr,
+            )
 
         array_match = _JSON_ARRAY_RE.search(cleaned)
         if array_match:
             try:
                 return json.loads(array_match.group())
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                print(
+                    f"[LLMAnalyzer][dbg] array regex matched but loads failed: "
+                    f"{exc.msg} @col {exc.pos}; span=len{len(array_match.group())}",
+                    file=sys.stderr,
+                )
+        else:
+            print("[LLMAnalyzer][dbg] no '[' found in whole response", file=sys.stderr)
 
         object_match = _JSON_BLOCK_RE.search(cleaned)
         if object_match:
             try:
                 return json.loads(object_match.group())
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                print(
+                    f"[LLMAnalyzer][dbg] object regex matched but loads failed: "
+                    f"{exc.msg} @col {exc.pos}; span=len{len(object_match.group())}",
+                    file=sys.stderr,
+                )
+        else:
+            print("[LLMAnalyzer][dbg] no '{' found in whole response", file=sys.stderr)
 
         print(
-            f"[LLMAnalyzer] Failed to parse JSON response: {text[:200]}",
+            f"[LLMAnalyzer] Failed to parse JSON response (full {len(text)} chars). "
+            f"Tails-300: {text[-300:]}",
             file=sys.stderr,
         )
         return None

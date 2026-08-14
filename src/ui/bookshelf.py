@@ -1,17 +1,8 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QListWidget, QListWidgetItem, QLabel
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QFont
+from config import get_app_data_dir, get_db_path
 from character_engine.character_store import CharacterStore
-import os
-
-
-def get_app_data_dir() -> str:
-    appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-    return os.path.join(appdata, "xMOD-AAE")
-
-
-def get_db_path() -> str:
-    return os.path.join(get_app_data_dir(), "store.db")
 
 
 class BookshelfWidget(QWidget):

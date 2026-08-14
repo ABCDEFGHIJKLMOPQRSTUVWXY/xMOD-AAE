@@ -16,6 +16,9 @@ class ChunkInfo:
     mp3_path: str = ""
     duration_ms: float = 0.0
     ready_event: object = field(default_factory=threading.Event)
+    driver_id: str = ""
+    voice_params: dict | None = None
+    speaker: str = ""
 
 
 _SPLIT_RE = re.compile(r"([，；。！？、：])")
@@ -92,28 +95,29 @@ def build(
     """
     narrator_voice = voice_map["_narrator_"]
 
-    spans: list[tuple[str, str, int, int]] = []
+    spans: list[tuple[str, str, str, int, int]] = []
     pos = char_offset
 
     for seg in dialogue_segments:
         seg_len = len(seg.text)
+        speaker = seg.speaker or "_narrator_"
         voice_id = voice_map.get(seg.speaker, narrator_voice) if seg.speaker else narrator_voice
-        spans.append((seg.text, voice_id, pos, pos + seg_len))
+        spans.append((seg.text, voice_id, speaker, pos, pos + seg_len))
         pos += seg_len
 
     if not spans:
         return []
 
-    merged: list[tuple[str, str, int, int]] = []
-    for text, voice_id, start, end in spans:
-        if merged and merged[-1][1] == voice_id:
-            prev_text, prev_voice, prev_start, prev_end = merged[-1]
-            merged[-1] = (prev_text + text, prev_voice, prev_start, end)
+    merged: list[tuple[str, str, str, int, int]] = []
+    for text, voice_id, speaker, start, end in spans:
+        if (merged and merged[-1][1] == voice_id and merged[-1][2] == speaker):
+            prev_text, prev_voice, prev_speaker, prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_text + text, prev_voice, prev_speaker, prev_start, end)
         else:
-            merged.append((text, voice_id, start, end))
+            merged.append((text, voice_id, speaker, start, end))
 
     chunks: list[ChunkInfo] = []
-    for text, voice_id, start, end in merged:
+    for text, voice_id, speaker, start, end in merged:
         if len(text) > 200:
             sub_texts = _split_long_text(text)
             sub_start = start
@@ -124,6 +128,7 @@ def build(
                     voice_id=voice_id,
                     char_start=sub_start,
                     char_end=sub_end,
+                    speaker=speaker,
                 ))
                 sub_start = sub_end
         else:
@@ -132,6 +137,7 @@ def build(
                 voice_id=voice_id,
                 char_start=start,
                 char_end=end,
+                speaker=speaker,
             ))
 
     return chunks

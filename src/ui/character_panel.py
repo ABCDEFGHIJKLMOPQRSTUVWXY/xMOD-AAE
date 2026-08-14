@@ -1,3 +1,5 @@
+import json
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QListWidget, QListWidgetItem,
     QLabel, QComboBox, QGroupBox, QTextEdit,
@@ -8,12 +10,13 @@ from PyQt6.QtGui import QFont
 
 
 class CharacterPanel(QWidget):
-    voice_changed = pyqtSignal(str, str)
-    reanalyze_requested = pyqtSignal()
+    voice_changed = pyqtSignal(str, str, str, object)  # (speaker, driver, voice_id, voice_params)
 
-    def __init__(self, available_voices: list[dict], parent=None):
+    def __init__(self, available_voices: list[dict], current_driver_id: str = "edge-tts",
+                 parent=None):
         super().__init__(parent)
         self._available_voices: list[dict] = available_voices
+        self._current_driver_id: str = current_driver_id
         self._characters: list[dict] = []
 
         layout = QVBoxLayout(self)
@@ -44,15 +47,33 @@ class CharacterPanel(QWidget):
         voice_layout = QHBoxLayout()
         voice_layout.addWidget(QLabel("语音:"))
         self._voice_combo = QComboBox()
-        self._voice_combo.currentTextChanged.connect(self._on_voice_changed)
         voice_layout.addWidget(self._voice_combo, 1)
         detail_layout.addLayout(voice_layout)
+
+        self._desc_group = QGroupBox("音色描述 (MiMo voicedesign)")
+        desc_layout = QVBoxLayout(self._desc_group)
+        self._desc_edit = QTextEdit()
+        self._desc_edit.setMaximumHeight(80)
+        self._desc_edit.setPlaceholderText(
+            "自然语言描述音色，例如：一位温柔成熟的女性，说话缓慢而沉稳。"
+            "留空则使用内置音色。"
+        )
+        desc_layout.addWidget(self._desc_edit)
+        detail_layout.addWidget(self._desc_group)
 
         self._detail_group.setLayout(detail_layout)
         self._detail_group.hide()
         layout.addWidget(self._detail_group)
 
         layout.addStretch()
+
+        self._voice_combo.currentIndexChanged.connect(self._on_voice_changed)
+        self._desc_edit.textChanged.connect(self._on_description_changed)
+
+    def set_driver(self, driver_id: str, available_voices: list[dict]) -> None:
+        """Update the active TTS driver and its available voices."""
+        self._current_driver_id = driver_id
+        self._available_voices = available_voices
 
     def set_characters(self, characters: list[dict]) -> None:
         self._characters = characters
@@ -89,24 +110,51 @@ class CharacterPanel(QWidget):
         ]
         self._detail_text.setPlainText("\n".join(lines))
 
-        self._voice_combo.blockSignals(True)
-        self._voice_combo.clear()
         current_voice = char.get("voice_id", "")
 
+        self._voice_combo.blockSignals(True)
+        self._voice_combo.clear()
         for voice in self._available_voices:
             name = voice.get("name", "")
             desc = voice.get("description", name)
-            label = f"{desc}"
-            self._voice_combo.addItem(label, name)
+            self._voice_combo.addItem(desc, name)
             if name == current_voice:
                 self._voice_combo.setCurrentIndex(self._voice_combo.count() - 1)
-
         self._voice_combo.blockSignals(False)
 
-    def _on_voice_changed(self, text: str) -> None:
+        voice_params = char.get("voice_params") or {}
+        try:
+            if isinstance(voice_params, str):
+                voice_params = json.loads(voice_params or "{}")
+        except json.JSONDecodeError:
+            voice_params = {}
+
+        self._desc_group.setVisible(self._current_driver_id == "mimo")
+        self._desc_edit.blockSignals(True)
+        self._desc_edit.setPlainText(voice_params.get("voice_description", ""))
+        self._desc_edit.blockSignals(False)
+
+    def _on_voice_changed(self) -> None:
+        self._emit_voice_change()
+
+    def _on_description_changed(self) -> None:
+        self._emit_voice_change()
+
+    def _emit_voice_change(self) -> None:
+        row = self._list.currentRow()
+        if row < 0 or row >= len(self._characters):
+            return
+        speaker_name = self._characters[row].get("name", "")
+        if not speaker_name:
+            return
         voice_id = self._voice_combo.currentData()
-        current_row = self._list.currentRow()
-        if current_row >= 0 and current_row < len(self._characters) and voice_id:
-            speaker_name = self._characters[current_row].get("name", "")
-            if speaker_name:
-                self.voice_changed.emit(speaker_name, voice_id)
+        if not voice_id:
+            return
+
+        voice_params = None
+        if self._current_driver_id == "mimo":
+            desc = self._desc_edit.toPlainText().strip()
+            if desc:
+                voice_params = {"voice_description": desc}
+
+        self.voice_changed.emit(speaker_name, self._current_driver_id, voice_id, voice_params)

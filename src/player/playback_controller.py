@@ -33,7 +33,8 @@ class PlaybackController(QObject):
         self._audio_player = AudioPlayer()
         self._chunk_queue = ChunkQueue()
         self._cache_manager = None
-        self._synthesize_fn = None
+        self._driver_manager = None
+        self._default_driver_id: str = "edge-tts"
 
         pygame.mixer.music.set_endevent(_MUSIC_END_EVENT)
 
@@ -43,16 +44,19 @@ class PlaybackController(QObject):
 
         self._chunk_queue.chunk_ready.connect(self._on_chunk_ready)
 
-    def configure(self, cache_manager, synthesize_fn):
+    def configure(self, cache_manager, driver_manager, default_driver_id: str = "edge-tts"):
         self._cache_manager = cache_manager
-        self._synthesize_fn = synthesize_fn
+        self._driver_manager = driver_manager
+        self._default_driver_id = default_driver_id
 
     def load_chapter(self, chapter_index: int, chapter_text: str,
                      voice_map: dict[str, str], paragraph_dialogue_segments: list,
-                     total_chapters: int = 1):
+                     total_chapters: int = 1,
+                     voice_meta: dict[str, dict] | None = None):
         self.stop()
         self.chapter_index = chapter_index
         self.voice_map = voice_map
+        self._voice_meta = voice_meta or {}
         self._total_chapters = total_chapters
         self.chunks = []
 
@@ -64,8 +68,22 @@ class PlaybackController(QObject):
             if para_chunks:
                 char_offset = para_chunks[-1].char_end + 1  # +1 与展示文本中的段落间 \\n 对齐
 
+        self._attach_chunk_voice_meta()
         self.chunk_index = 0
         self.chapter_changed.emit(chapter_index, total_chapters)
+
+    def _attach_chunk_voice_meta(self):
+        """Copy driver id / voice params from the voice map onto each chunk.
+
+        Each chunk carries its speaker (set in segment_builder.build), so the
+        params are looked up per speaker rather than per voice_id. This keeps
+        per-character voicedesign intact even when several speakers share the
+        same voice id (e.g. MiMo's single built-in voice).
+        """
+        for chunk in self.chunks:
+            meta = self._voice_meta.get(chunk.speaker) or {}
+            chunk.driver_id = meta.get("driver", "") or self._default_driver_id
+            chunk.voice_params = meta.get("voice_params") or None
 
     def play(self):
         if not self.chunks:
@@ -130,7 +148,7 @@ class PlaybackController(QObject):
 
         self._chunk_queue.configure(
             self.chunks, chunk_index, self.speed,
-            self._cache_manager, self._synthesize_fn
+            self._cache_manager, self._driver_manager, self._default_driver_id
         )
         self._chunk_queue.start()
 

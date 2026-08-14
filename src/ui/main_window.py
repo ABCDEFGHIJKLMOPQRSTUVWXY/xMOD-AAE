@@ -2,6 +2,7 @@ import os
 import sys
 import uuid
 import shutil
+import json
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -10,10 +11,11 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
+from config import get_app_data_dir, get_books_dir, get_cache_dir, get_db_path
 from character_engine.character_store import CharacterStore
 from tts_engine.cache_manager import CacheManager
-from tts_engine.edge_tts_client import synthesize_sync
-from tts_engine.voice_registry import get_voices, get_default_narrator_voice
+from tts_engine.drivers import create_driver_manager
+from tts_engine.voice_registry import get_default_narrator_voice
 from player.playback_controller import PlaybackController
 from ui.bookshelf import BookshelfWidget
 from ui.reader_view import ReaderView
@@ -21,29 +23,6 @@ from ui.character_panel import CharacterPanel
 from ui.control_bar import ControlBar
 from ui.settings_dialog import SettingsDialog
 from ui.chapter_list import ChapterListWidget
-
-
-def get_app_data_dir() -> str:
-    appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-    path = os.path.join(appdata, "xMOD-AAE")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def get_books_dir() -> str:
-    path = os.path.join(get_app_data_dir(), "books")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def get_cache_dir() -> str:
-    path = os.path.join(get_app_data_dir(), "cache")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def get_db_path() -> str:
-    return os.path.join(get_app_data_dir(), "store.db")
 
 
 class CharacterAnalysisWorker(QThread):
@@ -68,6 +47,8 @@ class CharacterAnalysisWorker(QThread):
                 progress_callback=lambda cur, total, msg: self.progress.emit(cur, total, msg),
             )
             from character_engine.aggregator import collect
+            from character_engine.speaker_normalizer import normalize_speakers
+            normalize_speakers(segments_with_speakers)
             speaker_infos = collect(segments_with_speakers)
             profiles = self._analyzer.analyze_characters(
                 speaker_infos,
@@ -88,11 +69,20 @@ class MainWindow(QMainWindow):
 
         self._store = CharacterStore(get_db_path())
         self._store.init_db()
+
+        self._driver_manager = create_driver_manager(
+            get_settings=self._store.get_setting,
+            set_settings=self._store.set_setting,
+        )
+        self._current_driver = self._driver_manager.get_current_driver()
+
         self._cache_manager = CacheManager(get_cache_dir())
-        self._available_voices: list[dict] = get_voices()
+        self._available_voices: list[dict] = self._current_driver.get_voices()
 
         self._controller = PlaybackController()
-        self._controller.configure(self._cache_manager, synthesize_sync)
+        self._controller.configure(
+            self._cache_manager, self._driver_manager, self._current_driver.id
+        )
 
         self._current_book_id: str = ""
         self._chapters: list[tuple[str, str]] = []
@@ -101,6 +91,9 @@ class MainWindow(QMainWindow):
         self._dialogue_segments_cache: dict[int, list] = {}
         self._original_paragraphs_cache: dict[int, list[str]] = {}
         self._voice_map: dict[str, str] = {"_narrator_": get_default_narrator_voice()}
+        self._voice_meta: dict[str, dict] = {
+            "_narrator_": {"driver": self._current_driver.id, "voice_params": None}
+        }
 
         self._build_menu_bar()
         self._build_central_layout()
@@ -135,7 +128,9 @@ class MainWindow(QMainWindow):
 
         self._chapter_list = ChapterListWidget()
         self._reader_view = ReaderView()
-        self._character_panel = CharacterPanel(self._available_voices)
+        self._character_panel = CharacterPanel(
+            self._available_voices, current_driver_id=self._current_driver.id
+        )
 
         self._splitter.addWidget(self._chapter_list)
         self._splitter.addWidget(self._reader_view)
@@ -265,11 +260,19 @@ class MainWindow(QMainWindow):
             self._dialogue_segments_cache[ch_idx] = para_dialogue_segments
 
         db_voice_map = self._store.get_voice_map(book_id)
-        if len(db_voice_map) <= 1:
-            default_narrator = get_default_narrator_voice()
-            self._voice_map = {"_narrator_": default_narrator}
-        else:
-            self._voice_map = db_voice_map
+        narrator_driver, narrator_voice, narrator_params = self._get_narrator_default()
+        self._voice_map = {"_narrator_": narrator_voice}
+        self._voice_meta = {
+            "_narrator_": {"driver": narrator_driver, "voice_params": narrator_params}
+        }
+        for speaker, entry in db_voice_map.items():
+            if speaker == "_narrator_":
+                continue
+            self._voice_map[speaker] = entry["voice_id"]
+            self._voice_meta[speaker] = {
+                "driver": entry["driver"],
+                "voice_params": entry.get("voice_params") or None,
+            }
 
         self._bookshelf.hide()
         self._splitter.show()
@@ -327,6 +330,25 @@ class MainWindow(QMainWindow):
         display_text = "\n".join(display_parts) if display_parts else ""
         return display_text, global_segments
 
+    def _get_narrator_default(self) -> tuple[str, str, dict | None]:
+        """Resolve the default narrator voice from settings + current driver.
+
+        Returns:
+            ``(driver_id, voice_id, voice_params)``.
+        """
+        driver_id = self._store.get_setting("narrator_driver", "")
+        driver = self._driver_manager.get_driver(driver_id)
+        if driver is None:
+            driver = self._current_driver
+        voice = self._store.get_setting("narrator_voice", "")
+        if not any(v.get("name") == voice for v in driver.get_voices()):
+            voice = driver.get_default_narrator_voice()
+        try:
+            params = json.loads(self._store.get_setting("narrator_voice_params", "{}") or "{}")
+        except json.JSONDecodeError:
+            params = {}
+        return driver.id, voice, params or None
+
     def _on_chapter_clicked(self, index: int) -> None:
         self._controller.stop()
         self._load_chapter(index)
@@ -347,7 +369,8 @@ class MainWindow(QMainWindow):
 
         self._controller.load_chapter(
             chapter_index, chapter_text, self._voice_map,
-            para_segments, len(self._chapters)
+            para_segments, len(self._chapters),
+            voice_meta=self._voice_meta
         )
         self._controller.play()
 
@@ -403,20 +426,53 @@ class MainWindow(QMainWindow):
     def _on_analysis_finished(self, profiles: list, segments_with_speakers: list) -> None:
         from character_engine.voice_mapper import assign_voice
 
+        current_driver = self._driver_manager.get_current_driver()
+
         used_voices: set[str] = set()
+        voice_meta: dict[str, dict] = {}
 
         for profile in profiles:
-            voice_id = assign_voice(profile, self._available_voices, used_voices)
+            driver, voice_id, voice_params = assign_voice(
+                profile, current_driver.get_voices(), used_voices,
+                driver_id=current_driver.id,
+            )
             profile.voice_id = voice_id
             used_voices.add(voice_id)
+            voice_meta[profile.name] = {
+                "driver": driver, "voice_id": voice_id, "voice_params": voice_params,
+            }
 
         self._store.save_characters(self._current_book_id, profiles)
+        for name, meta in voice_meta.items():
+            self._store.update_character_voice(
+                self._current_book_id, name, meta["voice_id"],
+                meta["driver"], meta["voice_params"],
+            )
 
-        narrator_voice = self._voice_map.get("_narrator_", get_default_narrator_voice())
+        narrator_driver, narrator_voice, narrator_params = self._get_narrator_default()
+        current_narrator_meta = self._voice_meta.get("_narrator_") or {}
+        if current_narrator_meta.get("driver"):
+            narrator_driver = current_narrator_meta["driver"]
+            narrator_voice = self._voice_map.get("_narrator_", narrator_voice)
+            narrator_params = current_narrator_meta.get("voice_params") or narrator_params
+
         self._voice_map = {"_narrator_": narrator_voice}
+        self._voice_meta = {
+            "_narrator_": {"driver": narrator_driver, "voice_params": narrator_params}
+        }
         for profile in profiles:
             self._voice_map[profile.name] = profile.voice_id
-        self._store.save_voice_map(self._current_book_id, self._voice_map)
+            self._voice_meta[profile.name] = voice_meta[profile.name]
+
+        structured_map = {
+            speaker: {
+                "voice_id": voice_id,
+                "driver": self._voice_meta[speaker]["driver"],
+                "voice_params": self._voice_meta[speaker]["voice_params"],
+            }
+            for speaker, voice_id in self._voice_map.items()
+        }
+        self._store.save_voice_map(self._current_book_id, structured_map)
 
         characters = self._store.get_characters(self._current_book_id)
         self._character_panel.set_characters(characters)
@@ -434,9 +490,13 @@ class MainWindow(QMainWindow):
             "3. 或在 设置 → LLM 模型 中切换到云端 API"
         )
 
-    def _build_speaker_id_batches(self, batch_size: int = 5) -> list[list[tuple[str, list, int]]]:
+    def _build_speaker_id_batches(
+        self, batch_size: int = 5, max_chars: int = 6000
+    ) -> list[list[tuple[str, list, int]]]:
+        """按段落数且累计字符数分批，避免单批过大导致云端超时。"""
         batches: list[list[tuple[str, list, int]]] = []
         current_batch: list[tuple[str, list, int]] = []
+        current_chars = 0
 
         for ch_idx in range(len(self._chapters)):
             para_segments = self._dialogue_segments_cache.get(ch_idx, [])
@@ -450,19 +510,36 @@ class MainWindow(QMainWindow):
                 base_offset = original_para.find(stripped_text)
                 if base_offset < 0:
                     base_offset = 0
-                current_batch.append((original_para, dialogue_spans, base_offset))
-                if len(current_batch) >= batch_size:
+
+                para_chars = len(original_para)
+                if current_batch and (
+                    len(current_batch) >= batch_size
+                    or current_chars + para_chars > max_chars
+                ):
                     batches.append(current_batch)
                     current_batch = []
+                    current_chars = 0
+
+                current_batch.append((original_para, dialogue_spans, base_offset))
+                current_chars += para_chars
 
         if current_batch:
             batches.append(current_batch)
 
         return batches
 
-    def _on_character_voice_changed(self, speaker_name: str, voice_id: str) -> None:
+    def _on_character_voice_changed(
+        self,
+        speaker_name: str,
+        driver: str,
+        voice_id: str,
+        voice_params: dict | None = None,
+    ) -> None:
         self._voice_map[speaker_name] = voice_id
-        self._store.update_character_voice(self._current_book_id, speaker_name, voice_id)
+        self._voice_meta[speaker_name] = {"driver": driver, "voice_params": voice_params}
+        self._store.update_character_voice(
+            self._current_book_id, speaker_name, voice_id, driver, voice_params
+        )
 
         if self._controller.is_playing:
             self._controller.stop()
@@ -470,9 +547,21 @@ class MainWindow(QMainWindow):
             self._status_label.setText(f"已更新 {speaker_name} 的语音，下次播放时生效")
 
     def _show_settings(self) -> None:
-        dialog = SettingsDialog(self._store, self._available_voices, self)
+        dialog = SettingsDialog(self._store, self._driver_manager, self)
         if dialog.exec() == dialog.DialogCode.Accepted:
+            self._apply_driver_switch()
             self._status_label.setText("设置已保存")
+
+    def _apply_driver_switch(self) -> None:
+        """Apply a possibly-changed TTS engine after settings are saved."""
+        new_driver = self._driver_manager.get_current_driver()
+        self._current_driver = new_driver
+        self._available_voices = new_driver.get_voices()
+        self._character_panel.set_driver(new_driver.id, self._available_voices)
+        self._controller.stop()
+        self._controller.configure(
+            self._cache_manager, self._driver_manager, new_driver.id
+        )
 
     def _on_toggle_segments(self, checked: bool) -> None:
         """切换分段结构叠加的显示/隐藏。"""
